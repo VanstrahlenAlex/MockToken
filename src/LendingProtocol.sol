@@ -115,7 +115,172 @@ contract LendingProtocol is ReentrancyGuard, Pausable, Ownable {
 	}
 
 	/**
-	 * @dev Unpause the protocol
+	 * @dev Deosit tokens to earn interest
+	 * @param token The token to deposit
+	 * @param amount The amount to deposit
+	 */
+	function deposit(address token, uint256 amount) external nonReentrant onlyActiveMarket(token) whenNotPaused {
+		require(amount > 0, "Amount must be greater than 0");
+		IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
+		userDeposits[msg.sender][token] += amount;
+		users[msg.sender].totalDeposited += amount;
+		users[msg.sender].lastUpdateTime = block.timestamp;
+		users[msg.sender].isActive = true;
+		markets[token].totalSupply += amount;
+
+		markets[token].totalSupply += amount;
+		emit Deposit(msg.sender, token, amount);
+	}
+
+	/**
+	 * @dev Withdraw tokens from the protocol
+	 * @param token The token to withdraw
+	 * @param amount The amount to withdraw
+	 */
+
+	function withdraw(address token, uint256 amount) external nonReentrant onlyActiveMarket(token) whenNotPaused {
+		require(amount > 0, "Amount must be greater than 0");
+		require(userDeposits[msg.sender][token] >= amount, "Insufficient deposit balance");
+		require(canWithdraw(msg.sender, token, amount), "Withdrawal would violate health factor");
+
+		userDeposits[msg.sender][token] -= amount;
+		users[msg.sender].totalDeposited -= amount;
+		users[msg.sender].lastUpdateTime = block.timestamp;
+
+		if (users[msg.sender].totalDeposited == 0){
+			users[msg.sender].isActive = false;
+		}
+
+		markets[token].totalSupply -= amount;
+		IERC20(token).safeTransfer(msg.sender, amount);
+
+		emit Withdraw(msg.sender, token, amount);	
+	}
+
+	function borrow(address token, uint256 amount) external nonReentrant whenNotPaused() onlyActiveMarket(token){
+		require(amount > 0, "Amount must be greater than 0");
+		require(markets[token].totalSupply >= amount, "Insufficient liquidity");
+		require(canBorrow(msg.sender, token, amount), "Borrow would violate health factor");
+
+		userBorrows[msg.sender][token] += amount;
+		users[msg.sender].totalBorrowed += amount;
+		users[msg.sender].lastUpdateTime = block.timestamp;
+		users[msg.sender].isActive = true;
+		markets[token].totalBorrow += amount;
+		
+		IERC20(token).safeTransfer(msg.sender, amount);
+
+		emit Borrow(msg.sender, token, amount);	
+	}
+
+	function repay(address token, uint256 amount) external nonReentrant() whenNotPaused onlyActiveMarket(token){
+		require(amount > 0, "Amount must be greater than 0");
+		require(userBorrows[msg.sender][token] >= amount, "Insufficient borrow");
+
+		IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+		userBorrows[msg.sender][token] -= amount;
+		users[msg.sender].totalBorrowed -= amount;
+		users[msg.sender].lastUpdateTime = block.timestamp;
+
+		if (users[msg.sender].totalBorrowed == 0){
+			users[msg.sender].isActive = false;
+		}
+
+		markets[token].totalBorrow -= amount;
+		
+
+		emit Repay(msg.sender, token, amount);
+	}
+
+	/**
+	 * @dev Check if user can withdraw without making position unsafe
+	 * @param user The user address to check
+	 * @param token The token to withdraw
+	 * @param amount The amount to withdraw
+	 * @return True if user can withdraw, false otherwise
+	 */
+	function canWithdraw(address user, address token, uint256 amount) public view returns (bool) {
+		uint256 currentRatio = getCollateralizationRatio(user);
+		if(currentRatio == type(uint256).max) return true;
+
+		//Calculate new ratio after withdraw
+		uint256 newColleteralValue = 0;
+		uint256 totalBorrowValue = 0;
+
+		for (uint256 i = 0; i < supportedTokens.length; i++) {
+			address supportedToken = supportedTokens[i];
+			if(markets[supportedTokens].isActive) {
+				uint256 depositAmount = userDeposits[user][supportedToken];
+				uint256 borrowAmount = userBorrows[user][supportedToken];
+				
+				if(supportedToken == token){
+					depositAmount = depositAmount > amount ? depositAmount - amount: 0;
+				}
+
+				if (depositAmount > 0) {
+					newColleteralValue += (depositAmount * markets[supportedToken].collateralFactor) / BASIS_POINT;
+				}
+
+				if (borrowAmount > 0) {
+					totalBorrowValue += borrowAmount;
+				}
+			}
+		}
+
+		if(totalBorrowValue = 0) return true;
+		uint256 newRatio = (newColleteralValue * BASIS_POINT) / totalBorrowValue;
+
+		return newRatio >= LIQUIDATION_THRESHOLD;
+	}
+
+
+
+	function isLiquidatable(address user) public view returns (bool) {
+		uint256 ratio = getCollateralizationRatio(user);
+		return ratio < LIQUIDATION_THRESHOLD;
+	}
+
+	function findBestCollateral(address user) internal view returns (address) {
+		address bestToken = address(0);
+		uint256 bestValue = 0;
+
+		for (uint256 i = 0; i < supportedTokens.length; i++){
+			address token = supportedTokens[i];
+			if (markets[token].isActive && userDeposits[user][token] > 0) {
+				uint256 value = (userDeposits[user][token] * markets[token].collateralFactor) / BASIS_POINT; 
+				if(value > bestValue) {
+					bestValue = value; 
+					bestToken = token;
+				}
+			}
+		}
+	}
+
+
+	function getCollateralizationRatio(address user) public view returns (uint256 ratio) {
+		uint256 totalColleteralValue = 0;
+		uint256 totalBorrowValue = 0;
+
+		for (uint256 i = 0; i < supportedTokens.length; i++) {
+			address token = supportedTokens[i];
+			if (markets[token].isActive) {
+				uint256 depositAmount = userDeposits[user][token];
+				uint256 borrowAmount = userBorrows[user][token];
+
+				if (depositAmount > 0) {
+					totalColleteralValue += (depositAmount * markets[token].collateralFactor) / BASIS_POINT;
+				}
+
+				if (borrowAmount > 0) {
+					totalBorrowValue += borrowAmount;
+				}
+			}
+		}
+	}
+
+	/**
+	 * @dev Pause the protocol
 	 */
 	function pause() external onlyOwner{
 		_pause();
